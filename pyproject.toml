@@ -1,0 +1,18 @@
+[project]
+name = "hikeping"
+version = "0.1.0"
+description = "Weekly St. John's Hike Club weekend hike checker"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "apscheduler>=3.10.4",
+  "beautifulsoup4>=4.12.3",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+hikeping = "hikeping.main:main"
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
