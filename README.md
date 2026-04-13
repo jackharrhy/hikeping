@@ -18,6 +18,12 @@ cp .env.example .env
 ```bash
 export $(grep -v '^#' .env | xargs)
 uv run hikeping --once
+
+# show next upcoming hike
+uv run hikeping --next
+
+# show + post next upcoming hike
+uv run hikeping --next --post
 ```
 
 ## Run scheduler (every Friday, 6:00 PM)

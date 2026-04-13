@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ from bs4 import BeautifulSoup
 HIKE_URL = "https://www.stjohnshikeclub.com/upcoming-hike.html"
 TIMEZONE = ZoneInfo(os.getenv("HIKEPING_TIMEZONE", "America/St_Johns"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+EVENTS_DATA_URL = "https://www.stjohnshikeclub.com/events-data.js"
 
 
 def next_weekend_dates(now: datetime) -> tuple[datetime, datetime]:
@@ -75,6 +77,38 @@ def fetch_page_text() -> str:
     return soup.get_text(" ", strip=True)
 
 
+def fetch_events_js() -> str:
+    with httpx.Client(timeout=20, follow_redirects=True) as client:
+        res = client.get(EVENTS_DATA_URL, headers={"User-Agent": "hikeping/0.1"})
+        res.raise_for_status()
+    return res.text
+
+
+def _unescape_js_string(s: str) -> str:
+    return bytes(s, "utf-8").decode("unicode_escape")
+
+
+def get_next_upcoming_hike(now: datetime) -> tuple[datetime, str] | None:
+    js = fetch_events_js()
+    # event objects consistently have title then date near the top
+    pattern = re.compile(
+        r'title:\s*"(?P<title>(?:\\.|[^"])*)".*?date:\s*"(?P<date>\d{4}-\d{2}-\d{2})"',
+        re.DOTALL,
+    )
+    upcoming: list[tuple[datetime, str]] = []
+    today = now.date()
+    for m in pattern.finditer(js):
+        d = datetime.strptime(m.group("date"), "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+        if d.date() >= today:
+            upcoming.append((d, _unescape_js_string(m.group("title"))))
+
+    if not upcoming:
+        return None
+
+    upcoming.sort(key=lambda x: x[0])
+    return upcoming[0]
+
+
 def post_discord(message: str) -> bool:
     if not DISCORD_WEBHOOK_URL:
         print("DISCORD_WEBHOOK_URL is not set", file=sys.stderr)
@@ -82,6 +116,17 @@ def post_discord(message: str) -> bool:
 
     with httpx.Client(timeout=20) as client:
         res = client.post(DISCORD_WEBHOOK_URL, json={"content": message})
+        res.raise_for_status()
+    return True
+
+
+def post_discord_to_webhook(webhook_url: str, message: str) -> bool:
+    if not webhook_url:
+        print("Webhook URL is not set", file=sys.stderr)
+        return False
+
+    with httpx.Client(timeout=20) as client:
+        res = client.post(webhook_url, json={"content": message})
         res.raise_for_status()
     return True
 
@@ -107,9 +152,50 @@ def check_and_notify() -> None:
         print("No upcoming weekend hike detected.")
 
 
+def run_next_hike(post: bool = False, webhook_url: str | None = None) -> None:
+    now = datetime.now(TIMEZONE)
+    next_hike = get_next_upcoming_hike(now)
+    if not next_hike:
+        print("No upcoming hikes found.")
+        return
+
+    date, title = next_hike
+    pretty_date = date.strftime("%a, %b %d").replace(" 0", " ")
+    msg = f"🌳 Next St. John's Hike Club hike: {title} ({pretty_date})\n{HIKE_URL}"
+    print(msg)
+
+    if post:
+        target = webhook_url or DISCORD_WEBHOOK_URL
+        sent = post_discord_to_webhook(target, msg)
+        if sent:
+            print("Posted to Discord.")
+
+
 def main() -> None:
-    run_once = "--once" in sys.argv
-    if run_once:
+    parser = argparse.ArgumentParser(description="St. John's Hike Club pinger")
+    parser.add_argument("--once", action="store_true", help="Run weekend check once")
+    parser.add_argument(
+        "--next",
+        action="store_true",
+        help="Show the next upcoming hike from events-data.js",
+    )
+    parser.add_argument(
+        "--post",
+        action="store_true",
+        help="When used with --next, post the message to Discord webhook",
+    )
+    parser.add_argument(
+        "--webhook-url",
+        default="",
+        help="Optional webhook override (otherwise DISCORD_WEBHOOK_URL env var)",
+    )
+    args = parser.parse_args()
+
+    if args.next:
+        run_next_hike(post=args.post, webhook_url=args.webhook_url or None)
+        return
+
+    if args.once:
         check_and_notify()
         return
 
