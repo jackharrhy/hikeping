@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
 from apscheduler.schedulers.blocking import BlockingScheduler
-from bs4 import BeautifulSoup
 
 HIKE_URL = "https://www.stjohnshikeclub.com/upcoming-hike.html"
 TIMEZONE = ZoneInfo(os.getenv("HIKEPING_TIMEZONE", "America/St_Johns"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+HIKEPING_INFO_WEBHOOK_URL = os.getenv("HIKEPING_INFO_WEBHOOK_URL", "").strip()
 EVENTS_DATA_URL = "https://www.stjohnshikeclub.com/events-data.js"
+
+
+class EventFeedError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class HikeEvent:
+    date: datetime
+    title: str
+    start_time: str = ""
+    location: str = ""
+    difficulty: str = ""
+    distance: str = ""
+    cta_url: str = ""
 
 
 def next_weekend_dates(now: datetime) -> tuple[datetime, datetime]:
@@ -28,55 +45,6 @@ def next_weekend_dates(now: datetime) -> tuple[datetime, datetime]:
     return saturday, sunday
 
 
-def date_variants(d: datetime) -> list[str]:
-    month_full = d.strftime("%B")
-    month_abbr = d.strftime("%b")
-    month_abbr_dot = f"{month_abbr}."
-    day = str(d.day)
-    year = d.strftime("%Y")
-    weekday_full = d.strftime("%A")
-    weekday_abbr = d.strftime("%a")
-
-    return [
-        f"{month_full} {day}",
-        f"{month_full} {day}, {year}",
-        f"{month_abbr} {day}",
-        f"{month_abbr} {day}, {year}",
-        f"{month_abbr_dot} {day}",
-        f"{month_abbr_dot} {day}, {year}",
-        f"{weekday_full}, {month_full} {day}",
-        f"{weekday_full}, {month_abbr} {day}",
-        f"{weekday_abbr}, {month_abbr} {day}",
-    ]
-
-
-def page_mentions_weekend_hike(page_text: str, now: datetime) -> bool:
-    sat, sun = next_weekend_dates(now)
-    haystack = re.sub(r"\s+", " ", page_text).lower()
-
-    for needle in [*date_variants(sat), *date_variants(sun)]:
-        if needle.lower() in haystack:
-            return True
-
-    # fallback: if page names this coming Sat/Sun with no explicit month
-    sat_words = ["saturday", "sat"]
-    sun_words = ["sunday", "sun"]
-    if any(w in haystack for w in sat_words + sun_words) and (
-        "upcoming" in haystack or "this weekend" in haystack
-    ):
-        return True
-
-    return False
-
-
-def fetch_page_text() -> str:
-    with httpx.Client(timeout=20, follow_redirects=True) as client:
-        res = client.get(HIKE_URL, headers={"User-Agent": "hikeping/0.1"})
-        res.raise_for_status()
-    soup = BeautifulSoup(res.text, "html.parser")
-    return soup.get_text(" ", strip=True)
-
-
 def fetch_events_js() -> str:
     with httpx.Client(timeout=20, follow_redirects=True) as client:
         res = client.get(EVENTS_DATA_URL, headers={"User-Agent": "hikeping/0.1"})
@@ -85,39 +53,136 @@ def fetch_events_js() -> str:
 
 
 def _unescape_js_string(s: str) -> str:
-    return bytes(s, "utf-8").decode("unicode_escape")
+    return json.loads(f'"{s}"')
 
 
-def get_next_upcoming_hike(now: datetime) -> tuple[datetime, str] | None:
-    js = fetch_events_js()
-    # event objects consistently have title then date near the top
-    pattern = re.compile(
-        r'title:\s*"(?P<title>(?:\\.|[^"])*)".*?date:\s*"(?P<date>\d{4}-\d{2}-\d{2})"',
-        re.DOTALL,
-    )
-    upcoming: list[tuple[datetime, str]] = []
+def _extract_event_blocks(js: str) -> list[str]:
+    blocks: list[str] = []
+    depth = 0
+    start: int | None = None
+    in_string = False
+    escaped = False
+
+    for i, char in enumerate(js):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                blocks.append(js[start : i + 1])
+                start = None
+
+    return blocks
+
+
+def _js_string_field(block: str, field: str) -> str:
+    m = re.search(rf'\b{re.escape(field)}:\s*"(?P<value>(?:\\.|[^"\\])*)"', block)
+    if not m:
+        return ""
+    return _unescape_js_string(m.group("value"))
+
+
+def parse_events_js(js: str) -> list[HikeEvent]:
+    events: list[HikeEvent] = []
+    for block in _extract_event_blocks(js):
+        title = _js_string_field(block, "title")
+        date_value = _js_string_field(block, "date")
+        if not title or not date_value:
+            continue
+
+        try:
+            event_date = datetime.strptime(date_value, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+        except ValueError:
+            continue
+
+        events.append(
+            HikeEvent(
+                date=event_date,
+                title=title,
+                start_time=_js_string_field(block, "startTime"),
+                location=_js_string_field(block, "location"),
+                difficulty=_js_string_field(block, "difficulty"),
+                distance=_js_string_field(block, "distance"),
+                cta_url=_js_string_field(block, "ctaUrl"),
+            )
+        )
+
+    return events
+
+
+def get_next_upcoming_event(now: datetime) -> HikeEvent | None:
+    events = parse_events_js(fetch_events_js())
+    upcoming: list[HikeEvent] = []
     today = now.date()
-    for m in pattern.finditer(js):
-        d = datetime.strptime(m.group("date"), "%Y-%m-%d").replace(tzinfo=TIMEZONE)
-        if d.date() >= today:
-            upcoming.append((d, _unescape_js_string(m.group("title"))))
+    for event in events:
+        if event.date.date() >= today:
+            upcoming.append(event)
 
     if not upcoming:
         return None
 
-    upcoming.sort(key=lambda x: x[0])
+    upcoming.sort(key=lambda x: x.date)
     return upcoming[0]
 
 
-def post_discord(message: str) -> bool:
-    if not DISCORD_WEBHOOK_URL:
-        print("DISCORD_WEBHOOK_URL is not set", file=sys.stderr)
-        return False
+def get_next_upcoming_hike(now: datetime) -> tuple[datetime, str] | None:
+    event = get_next_upcoming_event(now)
+    if event is None:
+        return None
+    return event.date, event.title
 
-    with httpx.Client(timeout=20) as client:
-        res = client.post(DISCORD_WEBHOOK_URL, json={"content": message})
-        res.raise_for_status()
-    return True
+
+def get_upcoming_weekend_hike(now: datetime) -> HikeEvent | None:
+    events = parse_events_js(fetch_events_js())
+    if not events:
+        raise EventFeedError("No events could be parsed from events-data.js")
+
+    sat, sun = next_weekend_dates(now)
+    weekend_dates = {sat.date(), sun.date()}
+    weekend_events = [event for event in events if event.date.date() in weekend_dates]
+    if not weekend_events:
+        return None
+
+    weekend_events.sort(key=lambda event: event.date)
+    event = weekend_events[0]
+    return event
+
+
+def format_hike_message(event: HikeEvent) -> str:
+    pretty_date = event.date.strftime("%a, %b %d").replace(" 0", " ")
+    lines = [f"🌳 Next St. John's Hike Club hike: {event.title} ({pretty_date})"]
+    if event.start_time:
+        lines.append(f"Time: {event.start_time}")
+    if event.location:
+        lines.append(f"Location: {event.location}")
+    if event.difficulty:
+        lines.append(f"Difficulty: {event.difficulty}")
+    if event.distance:
+        lines.append(f"Distance: {event.distance}")
+    if event.cta_url:
+        lines.append(f"Register: {event.cta_url}")
+    lines.append(HIKE_URL)
+    return "\n".join(lines)
+
+
+def notify_info(message: str) -> bool:
+    if not HIKEPING_INFO_WEBHOOK_URL:
+        print(message, file=sys.stderr)
+        return False
+    return post_discord_to_webhook(HIKEPING_INFO_WEBHOOK_URL, message)
 
 
 def post_discord_to_webhook(webhook_url: str, message: str) -> bool:
@@ -133,17 +198,35 @@ def post_discord_to_webhook(webhook_url: str, message: str) -> bool:
 
 def check_and_notify() -> None:
     now = datetime.now(TIMEZONE)
-    print(f"[{now.isoformat()}] Checking {HIKE_URL}")
+    print(f"[{now.isoformat()}] Checking {EVENTS_DATA_URL}")
     try:
-        text = fetch_page_text()
+        event = get_upcoming_weekend_hike(now)
+    except EventFeedError as exc:
+        sat, sun = next_weekend_dates(now)
+        msg = (
+            "⚠️ hikeping could not find a complete upcoming weekend hike in "
+            f"events-data.js for {sat.date().isoformat()}/{sun.date().isoformat()}. "
+            f"The St. John's Hike Club site may have changed: {HIKE_URL}"
+        )
+        print(f"{msg} ({exc})", file=sys.stderr)
+        try:
+            notify_info(msg)
+        except Exception as notify_exc:
+            print(f"Failed to post info webhook: {notify_exc}", file=sys.stderr)
+        return
     except Exception as exc:
-        print(f"Failed to fetch hike page: {exc}", file=sys.stderr)
+        msg = f"⚠️ hikeping failed to fetch or parse events-data.js: {exc}"
+        print(msg, file=sys.stderr)
+        try:
+            notify_info(msg)
+        except Exception as notify_exc:
+            print(f"Failed to post info webhook: {notify_exc}", file=sys.stderr)
         return
 
-    if page_mentions_weekend_hike(text, now):
-        msg = f"🌳 Weekend hike looks posted: {HIKE_URL}"
+    if event:
+        msg = format_hike_message(event)
         try:
-            sent = post_discord(msg)
+            sent = post_discord_to_webhook(DISCORD_WEBHOOK_URL, msg)
             if sent:
                 print("Posted to Discord.")
         except Exception as exc:
@@ -154,14 +237,12 @@ def check_and_notify() -> None:
 
 def run_next_hike(post: bool = False, webhook_url: str | None = None) -> None:
     now = datetime.now(TIMEZONE)
-    next_hike = get_next_upcoming_hike(now)
+    next_hike = get_next_upcoming_event(now)
     if not next_hike:
         print("No upcoming hikes found.")
         return
 
-    date, title = next_hike
-    pretty_date = date.strftime("%a, %b %d").replace(" 0", " ")
-    msg = f"🌳 Next St. John's Hike Club hike: {title} ({pretty_date})\n{HIKE_URL}"
+    msg = format_hike_message(next_hike)
     print(msg)
 
     if post:
