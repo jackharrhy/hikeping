@@ -17,6 +17,7 @@ TIMEZONE = ZoneInfo(os.getenv("HIKEPING_TIMEZONE", "America/St_Johns"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 HIKEPING_INFO_WEBHOOK_URL = os.getenv("HIKEPING_INFO_WEBHOOK_URL", "").strip()
 EVENTS_DATA_URL = "https://www.stjohnshikeclub.com/events-data.js"
+IS_COMPONENTS_V2 = 1 << 15
 
 
 class EventFeedError(Exception):
@@ -31,6 +32,10 @@ class HikeEvent:
     location: str = ""
     difficulty: str = ""
     distance: str = ""
+    duration: str = ""
+    elevation_gain: str = ""
+    description: str = ""
+    cta_text: str = ""
     cta_url: str = ""
 
 
@@ -116,6 +121,10 @@ def parse_events_js(js: str) -> list[HikeEvent]:
                 location=_js_string_field(block, "location"),
                 difficulty=_js_string_field(block, "difficulty"),
                 distance=_js_string_field(block, "distance"),
+                duration=_js_string_field(block, "duration"),
+                elevation_gain=_js_string_field(block, "elevationGain"),
+                description=_js_string_field(block, "description"),
+                cta_text=_js_string_field(block, "ctaText"),
                 cta_url=_js_string_field(block, "ctaUrl"),
             )
         )
@@ -178,6 +187,62 @@ def format_hike_message(event: HikeEvent) -> str:
     return "\n".join(lines)
 
 
+def _text_component(content: str) -> dict:
+    return {"type": 10, "content": content}
+
+
+def _separator_component() -> dict:
+    return {"type": 14, "divider": True, "spacing": 1}
+
+
+def _link_button(label: str, url: str) -> dict:
+    return {"type": 2, "style": 5, "label": label, "url": url}
+
+
+def build_hike_components_payload(event: HikeEvent) -> dict:
+    pretty_date = event.date.strftime("%a, %b %d").replace(" 0", " ")
+    when = pretty_date
+    if event.start_time:
+        when = f"{when} at {event.start_time}"
+
+    summary_lines = [f"## 🌳 {event.title}", f"**{when}**"]
+    if event.location:
+        summary_lines.append(f"📍 {event.location}")
+
+    detail_lines = []
+    for label, value in [
+        ("Difficulty", event.difficulty),
+        ("Distance", event.distance),
+        ("Duration", event.duration),
+        ("Elevation", event.elevation_gain),
+    ]:
+        if value:
+            detail_lines.append(f"**{label}:** {value}")
+
+    components = [_text_component("\n".join(summary_lines))]
+    if event.description:
+        components.extend([_separator_component(), _text_component(event.description)])
+    if detail_lines:
+        components.extend([_separator_component(), _text_component("\n".join(detail_lines))])
+
+    buttons = [_link_button("Hike Page", HIKE_URL)]
+    if event.cta_url:
+        buttons.insert(0, _link_button(event.cta_text or "Register", event.cta_url))
+    components.extend([_separator_component(), {"type": 1, "components": buttons}])
+
+    return {
+        "flags": IS_COMPONENTS_V2,
+        "components": [
+            {
+                "type": 17,
+                "accent_color": 0x2F855A,
+                "components": components,
+            }
+        ],
+        "allowed_mentions": {"parse": []},
+    }
+
+
 def notify_info(message: str) -> bool:
     if not HIKEPING_INFO_WEBHOOK_URL:
         print(message, file=sys.stderr)
@@ -185,15 +250,23 @@ def notify_info(message: str) -> bool:
     return post_discord_to_webhook(HIKEPING_INFO_WEBHOOK_URL, message)
 
 
-def post_discord_to_webhook(webhook_url: str, message: str) -> bool:
+def post_discord_payload(webhook_url: str, payload: dict) -> bool:
     if not webhook_url:
         print("Webhook URL is not set", file=sys.stderr)
         return False
 
+    params = None
+    if payload.get("flags", 0) & IS_COMPONENTS_V2:
+        params = {"with_components": "true"}
+
     with httpx.Client(timeout=20) as client:
-        res = client.post(webhook_url, json={"content": message})
+        res = client.post(webhook_url, json=payload, params=params)
         res.raise_for_status()
     return True
+
+
+def post_discord_to_webhook(webhook_url: str, message: str) -> bool:
+    return post_discord_payload(webhook_url, {"content": message})
 
 
 def check_and_notify() -> None:
@@ -224,9 +297,9 @@ def check_and_notify() -> None:
         return
 
     if event:
-        msg = format_hike_message(event)
+        payload = build_hike_components_payload(event)
         try:
-            sent = post_discord_to_webhook(DISCORD_WEBHOOK_URL, msg)
+            sent = post_discord_payload(DISCORD_WEBHOOK_URL, payload)
             if sent:
                 print("Posted to Discord.")
         except Exception as exc:
@@ -247,7 +320,7 @@ def run_next_hike(post: bool = False, webhook_url: str | None = None) -> None:
 
     if post:
         target = webhook_url or DISCORD_WEBHOOK_URL
-        sent = post_discord_to_webhook(target, msg)
+        sent = post_discord_payload(target, build_hike_components_payload(next_hike))
         if sent:
             print("Posted to Discord.")
 
