@@ -184,7 +184,23 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     return 2 * r * math.asin(math.sqrt(x))
 
 
-def fetch_trails_near_route(points: list[tuple[float, float]], pad: float = 0.02) -> list[list[tuple[float, float]]]:
+def _trail_length_km(trail: list[tuple[float, float]]) -> float:
+    total = 0.0
+    for i in range(1, len(trail)):
+        total += haversine_km(trail[i - 1], trail[i])
+    return total
+
+
+def _min_distance_to_points_km(pt: tuple[float, float], anchors: list[tuple[float, float]]) -> float:
+    return min(haversine_km(pt, a) for a in anchors)
+
+
+def fetch_trails_near_route(
+    points: list[tuple[float, float]],
+    pad: float = 0.02,
+    max_point_distance_km: float = 3.0,
+    max_trail_length_km: float = 20.0,
+) -> list[list[tuple[float, float]]]:
     if not points:
         return []
 
@@ -223,6 +239,7 @@ def fetch_trails_near_route(points: list[tuple[float, float]], pad: float = 0.02
         raise RuntimeError(f"All Overpass endpoints failed: {last_err}")
 
     trails: list[list[tuple[float, float]]] = []
+    anchors = points
     for el in data.get("elements", []):
         geom = el.get("geom") or []
         if len(geom) >= 2:
@@ -236,7 +253,16 @@ def fetch_trails_near_route(points: list[tuple[float, float]], pad: float = 0.02
             trail = [(float(p["lat"]), float(p["lon"])) for p in mgeom if "lat" in p and "lon" in p]
             if len(trail) >= 2:
                 trails.append(trail)
-    return trails
+
+    filtered: list[list[tuple[float, float]]] = []
+    for trail in trails:
+        near = [p for p in trail if _min_distance_to_points_km(p, anchors) <= max_point_distance_km]
+        if len(near) < 2:
+            continue
+        if _trail_length_km(near) > max_trail_length_km:
+            continue
+        filtered.append(near)
+    return filtered
 
 
 def render_route_png(
@@ -442,7 +468,12 @@ def run_next_hike_with_map(post: bool = False, webhook_url: str | None = None) -
         points = route_points(start, end)
     trail_lines: list[list[tuple[float, float]]] = []
     try:
-        trail_lines = fetch_trails_near_route(points, pad=0.05 if loop_hike else 0.02)
+        trail_lines = fetch_trails_near_route(
+            points,
+            pad=0.05 if loop_hike else 0.02,
+            max_point_distance_km=1.5 if loop_hike else 3.0,
+            max_trail_length_km=8.0 if loop_hike else 20.0,
+        )
         print(f"Loaded {len(trail_lines)} nearby trail segments from OSM/Overpass.")
     except Exception as exc:
         print(f"Trail overlay fetch failed (continuing): {exc}")
