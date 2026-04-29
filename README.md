@@ -25,6 +25,9 @@ uv run hikeping --next
 # show + post next upcoming hike
 uv run hikeping --next --post
 
+# show + post next upcoming hike with route map PNG attachment
+uv run hikeping --next --with-map --post
+
 # run tests
 uv run pytest
 ```
@@ -44,6 +47,7 @@ Set `HIKEPING_INFO_WEBHOOK_URL` to send scraper-health alerts to a separate Disc
 - Discord hike posts include the title, date, time, location, difficulty, distance, registration link, and hike page link when those fields exist in `events-data.js`.
 - If no weekend hike is detected, it logs and does not post.
 - If the structured event feed cannot be parsed, it logs and posts an alert to `HIKEPING_INFO_WEBHOOK_URL` when set.
+- `--with-map` uses free OSM/Nominatim + OSRM public APIs and attaches `next-hike-route.png`.
 
 ## Docker
 
