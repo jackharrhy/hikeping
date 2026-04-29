@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 import re
@@ -172,13 +173,23 @@ def route_points(start: tuple[float, float], end: tuple[float, float]) -> list[t
     return polyline.decode(geometry)
 
 
-def fetch_trails_near_route(points: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    lat1, lon1 = a
+    lat2, lon2 = b
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(x))
+
+
+def fetch_trails_near_route(points: list[tuple[float, float]], pad: float = 0.02) -> list[list[tuple[float, float]]]:
     if not points:
         return []
 
     lats = [p[0] for p in points]
     lons = [p[1] for p in points]
-    pad = 0.02
     s, w = min(lats) - pad, min(lons) - pad
     n, e = max(lats) + pad, max(lons) + pad
 
@@ -423,10 +434,15 @@ def run_next_hike_with_map(post: bool = False, webhook_url: str | None = None) -
                 print("Posted text-only message to Discord.")
         return
 
-    points = route_points(start, end)
+    loop_hike = haversine_km(start, end) < 0.5
+    if loop_hike:
+        points = [start, end]
+        print("Detected loop/out-and-back hike; skipping long OSRM route estimate.")
+    else:
+        points = route_points(start, end)
     trail_lines: list[list[tuple[float, float]]] = []
     try:
-        trail_lines = fetch_trails_near_route(points)
+        trail_lines = fetch_trails_near_route(points, pad=0.05 if loop_hike else 0.02)
         print(f"Loaded {len(trail_lines)} nearby trail segments from OSM/Overpass.")
     except Exception as exc:
         print(f"Trail overlay fetch failed (continuing): {exc}")
