@@ -24,6 +24,9 @@ uv run hikeping --next
 
 # show + post next upcoming hike
 uv run hikeping --next --post
+
+# show + post next upcoming hike with route map PNG attachment
+uv run hikeping --next --with-map --post
 ```
 
 ## Run scheduler (every Friday, 6:00 PM)
@@ -39,6 +42,7 @@ Defaults to timezone `America/St_Johns` (override with `HIKEPING_TIMEZONE`).
 
 - Discord message format: `🌳 Weekend hike looks posted: <link>`
 - If no weekend hike is detected, it logs and does not post.
+- `--with-map` uses free OSM/Nominatim + OSRM public APIs and attaches `next-hike-route.png`.
 
 ## Docker
 
