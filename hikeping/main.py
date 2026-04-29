@@ -23,6 +23,11 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 EVENTS_DATA_URL = "https://www.stjohnshikeclub.com/events-data.js"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/foot"
+OVERPASS_URLS = [
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+]
 GEOCODE_CACHE_PATH = Path(__file__).resolve().parent.parent / "state" / "geocode-cache.json"
 
 
@@ -167,16 +172,80 @@ def route_points(start: tuple[float, float], end: tuple[float, float]) -> list[t
     return polyline.decode(geometry)
 
 
+def fetch_trails_near_route(points: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+    if not points:
+        return []
+
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    pad = 0.02
+    s, w = min(lats) - pad, min(lons) - pad
+    n, e = max(lats) + pad, max(lons) + pad
+
+    query = f"""
+    [out:json][timeout:20];
+    (
+      way[highway~"path|footway|track|steps"]({s},{w},{n},{e});
+      way[route="hiking"]({s},{w},{n},{e});
+      relation[route="hiking"]({s},{w},{n},{e});
+    );
+    out geom;
+    """
+
+    last_err: Exception | None = None
+    data: dict = {}
+    for overpass_url in OVERPASS_URLS:
+        try:
+            with httpx.Client(timeout=25, follow_redirects=True) as client:
+                res = client.get(
+                    overpass_url,
+                    params={"data": query},
+                    headers={"User-Agent": "hikeping/0.1 (trail-overlay)"},
+                )
+                res.raise_for_status()
+                data = res.json()
+                break
+        except Exception as exc:
+            last_err = exc
+            continue
+    else:
+        raise RuntimeError(f"All Overpass endpoints failed: {last_err}")
+
+    trails: list[list[tuple[float, float]]] = []
+    for el in data.get("elements", []):
+        geom = el.get("geom") or []
+        if len(geom) >= 2:
+            trail = [(float(p["lat"]), float(p["lon"])) for p in geom if "lat" in p and "lon" in p]
+            if len(trail) >= 2:
+                trails.append(trail)
+        for member in el.get("members", []) or []:
+            mgeom = member.get("geometry") or []
+            if len(mgeom) < 2:
+                continue
+            trail = [(float(p["lat"]), float(p["lon"])) for p in mgeom if "lat" in p and "lon" in p]
+            if len(trail) >= 2:
+                trails.append(trail)
+    return trails
+
+
 def render_route_png(
     title: str,
     start: tuple[float, float],
     end: tuple[float, float],
     points: list[tuple[float, float]],
+    trail_lines: list[list[tuple[float, float]]],
     out_path: Path,
 ) -> None:
-    m = StaticMap(1100, 700, url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+    m = StaticMap(
+        1100,
+        700,
+        url_template="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}.jpg",
+    )
+    for trail in trail_lines:
+        trail_points = [(lon, lat) for lat, lon in trail]
+        m.add_line(Line(trail_points, "#FFD84D", 2))
     line_points = [(lon, lat) for lat, lon in points]
-    m.add_line(Line(line_points, "#2D7FF9", 4))
+    m.add_line(Line(line_points, "#00E5FF", 5))
     m.add_marker(CircleMarker((start[1], start[0]), "#0B8F3D", 8))
     m.add_marker(CircleMarker((end[1], end[0]), "#D62828", 8))
     image = m.render(zoom=None)
@@ -355,10 +424,16 @@ def run_next_hike_with_map(post: bool = False, webhook_url: str | None = None) -
         return
 
     points = route_points(start, end)
+    trail_lines: list[list[tuple[float, float]]] = []
+    try:
+        trail_lines = fetch_trails_near_route(points)
+        print(f"Loaded {len(trail_lines)} nearby trail segments from OSM/Overpass.")
+    except Exception as exc:
+        print(f"Trail overlay fetch failed (continuing): {exc}")
 
     with tempfile.TemporaryDirectory(prefix="hikeping-") as td:
         out = Path(td) / "next-hike-route.png"
-        render_route_png(title, start, end, points, out)
+        render_route_png(title, start, end, points, trail_lines, out)
         print(f"Generated map image: {out}")
         print(msg)
         if post:
