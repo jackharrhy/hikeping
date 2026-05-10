@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -648,11 +649,96 @@ def build_hike_components_payload(event: HikeEvent) -> dict:
     }
 
 
+INFO_WEBHOOK_MAX_ATTEMPTS = 3
+INFO_WEBHOOK_BACKOFF_SECONDS = 2.0
+INFO_WEBHOOK_MAX_BACKOFF_SECONDS = 30.0
+
+
+def _retry_after_seconds(response: httpx.Response, default: float) -> float:
+    """Pick a sleep duration before retrying, capped to a sane upper bound.
+
+    Discord 429s include a ``Retry-After`` header (seconds) and a JSON body
+    with a more precise ``retry_after`` float. Prefer the JSON body when it
+    parses; fall back to the header; fall back to the caller's default.
+    """
+
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 — body may be empty, html, etc.
+        body = None
+    if isinstance(body, dict) and isinstance(body.get("retry_after"), (int, float)):
+        return min(float(body["retry_after"]), INFO_WEBHOOK_MAX_BACKOFF_SECONDS)
+
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return min(float(header), INFO_WEBHOOK_MAX_BACKOFF_SECONDS)
+        except ValueError:
+            pass
+
+    return min(default, INFO_WEBHOOK_MAX_BACKOFF_SECONDS)
+
+
 def notify_info(message: str) -> bool:
+    """Send an alert to the info webhook, retrying transient failures.
+
+    The info webhook is the alarm channel — silently dropping a message here
+    means a real scraper outage goes unnoticed (which is exactly what happened
+    on May 8, 2026: the upstream site changed, the scraper raised, the info
+    webhook hit a Discord 429 on the first attempt, and the alert was lost).
+
+    Retries up to ``INFO_WEBHOOK_MAX_ATTEMPTS`` times on 429 and 5xx,
+    respecting the server-supplied ``Retry-After`` when present.
+    """
+
     if not HIKEPING_INFO_WEBHOOK_URL:
         print(message, file=sys.stderr)
         return False
-    return post_discord_to_webhook(HIKEPING_INFO_WEBHOOK_URL, message)
+
+    payload = {"content": message}
+    last_error: str | None = None
+
+    for attempt in range(1, INFO_WEBHOOK_MAX_ATTEMPTS + 1):
+        try:
+            with httpx.Client(timeout=20) as client:
+                res = client.post(HIKEPING_INFO_WEBHOOK_URL, json=payload)
+        except httpx.RequestError as exc:
+            last_error = f"network error: {exc}"
+            if attempt >= INFO_WEBHOOK_MAX_ATTEMPTS:
+                break
+            sleep_for = min(
+                INFO_WEBHOOK_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                INFO_WEBHOOK_MAX_BACKOFF_SECONDS,
+            )
+            print(
+                f"notify_info attempt {attempt} failed ({last_error}); "
+                f"retrying in {sleep_for:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_for)
+            continue
+
+        if res.status_code < 400:
+            return True
+
+        retryable = res.status_code == 429 or 500 <= res.status_code < 600
+        last_error = f"HTTP {res.status_code}"
+        if not retryable or attempt >= INFO_WEBHOOK_MAX_ATTEMPTS:
+            break
+
+        sleep_for = _retry_after_seconds(
+            res,
+            default=INFO_WEBHOOK_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+        )
+        print(
+            f"notify_info attempt {attempt} got {last_error}; "
+            f"retrying in {sleep_for:.1f}s",
+            file=sys.stderr,
+        )
+        time.sleep(sleep_for)
+
+    print(f"notify_info gave up after {INFO_WEBHOOK_MAX_ATTEMPTS} attempts ({last_error})", file=sys.stderr)
+    return False
 
 
 def post_discord_payload(webhook_url: str, payload: dict) -> bool:

@@ -119,7 +119,7 @@ def test_post_discord_payload_enables_components_v2(monkeypatch):
 
 
 def test_check_and_notify_sends_info_webhook_when_event_feed_breaks(monkeypatch):
-    posted: list[tuple[str, str]] = []
+    notified: list[str] = []
 
     class FixedDatetime(datetime):
         @classmethod
@@ -130,21 +130,20 @@ def test_check_and_notify_sends_info_webhook_when_event_feed_breaks(monkeypatch)
     # An HTML page with no `hikes:$R[...]` array — simulates upstream change
     # or maintenance page.
     monkeypatch.setattr(main, "fetch_events_js", lambda: "<!doctype html><html><body></body></html>")
+    # Stub notify_info itself so the test doesn't exercise the retry-loop HTTP
+    # path (covered separately) and doesn't hit the network.
     monkeypatch.setattr(
         main,
-        "post_discord_to_webhook",
-        lambda webhook_url, message: posted.append((webhook_url, message)) or True,
+        "notify_info",
+        lambda message: notified.append(message) or True,
     )
     monkeypatch.setattr(main, "DISCORD_WEBHOOK_URL", "https://discord.example/hikes")
     monkeypatch.setattr(main, "HIKEPING_INFO_WEBHOOK_URL", "https://discord.example/info")
 
     main.check_and_notify()
 
-    assert posted == [
-        (
-            "https://discord.example/info",
-            "⚠️ hikeping could not find a complete upcoming weekend hike on the upcoming-events page for 2026-04-25/2026-04-26. The St. John's Hike Club site may have changed: https://www.stjohnshikeclub.com/upcoming-events",
-        )
+    assert notified == [
+        "⚠️ hikeping could not find a complete upcoming weekend hike on the upcoming-events page for 2026-04-25/2026-04-26. The St. John's Hike Club site may have changed: https://www.stjohnshikeclub.com/upcoming-events",
     ]
 
 
@@ -211,3 +210,108 @@ def test_run_next_hike_posts_same_detailed_message(monkeypatch):
             main.build_hike_components_payload(main.parse_events_js(SAMPLE_UPCOMING_HTML)[0]),
         )
     ]
+
+
+class _FakeResponse:
+    """Minimal stand-in for httpx.Response covering only what notify_info uses."""
+
+    def __init__(self, status_code: int, headers: dict | None = None, body: dict | None = None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._body = body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no body")
+        return self._body
+
+
+def _install_fake_httpx(monkeypatch, responses: list):
+    """Patch main.httpx.Client so each .post() returns the next response in `responses`."""
+
+    posts: list[tuple[str, dict]] = []
+    queue = list(responses)
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json):
+            posts.append((url, json))
+            if not queue:
+                raise AssertionError("FakeClient.post called more times than expected")
+            result = queue.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    monkeypatch.setattr(main.httpx, "Client", FakeClient)
+    return posts
+
+
+def test_notify_info_retries_on_429_and_eventually_succeeds(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(main.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(main, "HIKEPING_INFO_WEBHOOK_URL", "https://discord.example/info")
+
+    posts = _install_fake_httpx(
+        monkeypatch,
+        [
+            _FakeResponse(429, headers={"retry-after": "1"}, body={"retry_after": 0.5}),
+            _FakeResponse(204),
+        ],
+    )
+
+    assert main.notify_info("hello") is True
+    assert len(posts) == 2
+    # JSON body's retry_after (0.5s) takes precedence over the header.
+    assert sleeps == [0.5]
+
+
+def test_notify_info_retries_on_5xx_then_gives_up(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(main.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(main, "HIKEPING_INFO_WEBHOOK_URL", "https://discord.example/info")
+    monkeypatch.setattr(main, "INFO_WEBHOOK_MAX_ATTEMPTS", 3)
+
+    posts = _install_fake_httpx(
+        monkeypatch,
+        [
+            _FakeResponse(503),
+            _FakeResponse(503),
+            _FakeResponse(503),
+        ],
+    )
+
+    assert main.notify_info("alarm") is False
+    assert len(posts) == 3
+    # Two sleeps (between attempts 1->2 and 2->3); no sleep after the last attempt.
+    assert len(sleeps) == 2
+
+
+def test_notify_info_does_not_retry_on_4xx_other_than_429(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(main.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(main, "HIKEPING_INFO_WEBHOOK_URL", "https://discord.example/info")
+
+    posts = _install_fake_httpx(
+        monkeypatch,
+        [_FakeResponse(404)],
+    )
+
+    assert main.notify_info("alarm") is False
+    assert len(posts) == 1
+    assert sleeps == []
+
+
+def test_notify_info_returns_false_when_webhook_unset(monkeypatch):
+    monkeypatch.setattr(main, "HIKEPING_INFO_WEBHOOK_URL", "")
+    # Should not even try to POST.
+    monkeypatch.setattr(main.httpx, "Client", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not POST")))
+    assert main.notify_info("alarm") is False
