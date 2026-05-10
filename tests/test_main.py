@@ -6,32 +6,30 @@ from zoneinfo import ZoneInfo
 from hikeping import main
 
 
-SAMPLE_EVENTS_JS = r'''
-const EVENTS = [
-  {
-    id: "three-ponds-barrens-dog-hike-apr",
-    title: "Three Ponds Barrens — Dog Hike \uD83D\uDC15",
-    date: "2026-04-26",
-    month: "Apr",
-    day: 26,
-    dow: "Sun",
-    type: "free",
-    price: null,
-    difficulty: "Easy–Moderate",
-    distance: "Variable",
-    duration: "2–3 hrs",
-    elevationGain: "Minimal",
-    startTime: "12:00 PM",
-    location: "Three Ponds Barrens · Near St. John’s",
-    description: "Bring the pups! A dog-friendly loop through the open barrens.",
-    ctaText: "Register Now",
-    ctaUrl: "https://tally.so/r/68OlLO",
-    mapLinks: {
-      startName: "Three Ponds Barrens Trailhead"
-    }
-  }
-];
-'''
+# Minimal HTML payload mimicking the SSR'd /upcoming-events page. The real page
+# embeds the hikes array as part of a much larger TanStack Start dehydrated
+# payload; for parsing purposes only the `hikes:$R[N]=[...]` literal matters.
+SAMPLE_UPCOMING_HTML = (
+    '<!doctype html><html><body><script>'
+    'self.$_TSR.router=($R=>$R[0]={'
+    'matches:[{loaderData:{'
+    'hikes:$R[15]=['
+    '$R[16]={'
+    'id:"three-ponds-barrens-dog-day",'
+    'name:"Three Ponds Barrens \\u2014 Dog Hike \\uD83D\\uDC15",'
+    'dateLabel:"April 26, 2026 \\u00b7 12:00 p.m.",'
+    'logisticsLine:"Three Ponds Barrens \\u00b7 Near St. John\'s \\u00b7 Variable \\u00b7 2-3 hrs",'
+    'difficulty:"easy",difficultyLabel:"Easy-Moderate",'
+    'description:"Bring the pups! A dog-friendly loop through the open barrens.",'
+    'trailHeadUrl:"https://www.google.com/maps/search/?api=1&query=Three+Ponds+Barrens",'
+    'trailEndUrl:"https://www.google.com/maps/search/?api=1&query=Three+Ponds+Barrens",'
+    'allTrailsUrl:"https://www.alltrails.com/trail/canada/newfoundland-and-labrador/three-ponds-barrens",'
+    'trailTypeLabel:"Loop",confirmedRegistrationCount:1,maxParticipants:null,'
+    'registrationFull:!1,status:"open",eventType:"free"'
+    '}'
+    ']}}]}'
+    '</script></body></html>'
+)
 
 
 def test_check_and_notify_posts_weekend_hike_details(monkeypatch):
@@ -43,7 +41,7 @@ def test_check_and_notify_posts_weekend_hike_details(monkeypatch):
             return cls(2026, 4, 24, 12, tzinfo=tz or ZoneInfo("America/St_Johns"))
 
     monkeypatch.setattr(main, "datetime", FixedDatetime)
-    monkeypatch.setattr(main, "fetch_events_js", lambda: SAMPLE_EVENTS_JS)
+    monkeypatch.setattr(main, "fetch_events_js", lambda: SAMPLE_UPCOMING_HTML)
     monkeypatch.setattr(
         main,
         "post_discord_payload",
@@ -57,13 +55,13 @@ def test_check_and_notify_posts_weekend_hike_details(monkeypatch):
     assert posted == [
         (
             "https://discord.example/hikes",
-            main.build_hike_components_payload(main.parse_events_js(SAMPLE_EVENTS_JS)[0]),
+            main.build_hike_components_payload(main.parse_events_js(SAMPLE_UPCOMING_HTML)[0]),
         )
     ]
 
 
 def test_build_hike_components_payload_includes_richer_event_details():
-    payload = main.build_hike_components_payload(main.parse_events_js(SAMPLE_EVENTS_JS)[0])
+    payload = main.build_hike_components_payload(main.parse_events_js(SAMPLE_UPCOMING_HTML)[0])
 
     assert payload["flags"] == 32768
     assert "content" not in payload
@@ -74,14 +72,15 @@ def test_build_hike_components_payload_includes_richer_event_details():
     rendered = str(payload)
     assert "Three Ponds Barrens — Dog Hike 🐕" in rendered
     assert "Sun, Apr 26" in rendered
-    assert "12:00 PM" in rendered
-    assert "Three Ponds Barrens · Near St. John’s" in rendered
-    assert "Easy–Moderate" in rendered
+    assert "12:00 p.m." in rendered
+    # logisticsLine is split into location/distance/duration on `·`
+    assert "Three Ponds Barrens" in rendered
+    assert "Easy-Moderate" in rendered
     assert "Variable" in rendered
-    assert "2–3 hrs" in rendered
-    assert "Minimal" in rendered
+    assert "2-3 hrs" in rendered
     assert "Bring the pups!" in rendered
-    assert "https://tally.so/r/68OlLO" in rendered
+    # /register URL is synthesised from the slug + eventType
+    assert "/register?hike=three-ponds-barrens-dog-day" in rendered
 
 
 def test_post_discord_payload_enables_components_v2(monkeypatch):
@@ -128,7 +127,9 @@ def test_check_and_notify_sends_info_webhook_when_event_feed_breaks(monkeypatch)
             return cls(2026, 4, 24, 12, tzinfo=tz or ZoneInfo("America/St_Johns"))
 
     monkeypatch.setattr(main, "datetime", FixedDatetime)
-    monkeypatch.setattr(main, "fetch_events_js", lambda: "const EVENTS = [];")
+    # An HTML page with no `hikes:$R[...]` array — simulates upstream change
+    # or maintenance page.
+    monkeypatch.setattr(main, "fetch_events_js", lambda: "<!doctype html><html><body></body></html>")
     monkeypatch.setattr(
         main,
         "post_discord_to_webhook",
@@ -142,7 +143,7 @@ def test_check_and_notify_sends_info_webhook_when_event_feed_breaks(monkeypatch)
     assert posted == [
         (
             "https://discord.example/info",
-            "⚠️ hikeping could not find a complete upcoming weekend hike in events-data.js for 2026-04-25/2026-04-26. The St. John's Hike Club site may have changed: https://www.stjohnshikeclub.com/upcoming-hike.html",
+            "⚠️ hikeping could not find a complete upcoming weekend hike on the upcoming-events page for 2026-04-25/2026-04-26. The St. John's Hike Club site may have changed: https://www.stjohnshikeclub.com/upcoming-events",
         )
     ]
 
@@ -157,17 +158,17 @@ def test_check_and_notify_posts_weekend_hike_when_optional_details_are_missing(
         def now(cls, tz=None):
             return cls(2026, 4, 24, 12, tzinfo=tz or ZoneInfo("America/St_Johns"))
 
-    events_js = r'''
-const EVENTS = [
-  {
-    title: "Three Ponds Barrens",
-    date: "2026-04-26"
-  }
-];
-'''
+    minimal_html = (
+        '<!doctype html><html><body><script>'
+        'hikes:$R[1]=['
+        '$R[2]={id:"three-ponds-barrens",name:"Three Ponds Barrens",'
+        'dateLabel:"April 26, 2026 \\u00b7 12:00 p.m."}'
+        ']'
+        '</script></body></html>'
+    )
 
     monkeypatch.setattr(main, "datetime", FixedDatetime)
-    monkeypatch.setattr(main, "fetch_events_js", lambda: events_js)
+    monkeypatch.setattr(main, "fetch_events_js", lambda: minimal_html)
     monkeypatch.setattr(
         main,
         "post_discord_payload",
@@ -181,7 +182,7 @@ const EVENTS = [
     assert posted == [
         (
             "https://discord.example/hikes",
-            main.build_hike_components_payload(main.parse_events_js(events_js)[0]),
+            main.build_hike_components_payload(main.parse_events_js(minimal_html)[0]),
         )
     ]
 
@@ -195,7 +196,7 @@ def test_run_next_hike_posts_same_detailed_message(monkeypatch):
             return cls(2026, 4, 24, 12, tzinfo=tz or ZoneInfo("America/St_Johns"))
 
     monkeypatch.setattr(main, "datetime", FixedDatetime)
-    monkeypatch.setattr(main, "fetch_events_js", lambda: SAMPLE_EVENTS_JS)
+    monkeypatch.setattr(main, "fetch_events_js", lambda: SAMPLE_UPCOMING_HTML)
     monkeypatch.setattr(
         main,
         "post_discord_payload",
@@ -207,6 +208,6 @@ def test_run_next_hike_posts_same_detailed_message(monkeypatch):
     assert posted == [
         (
             "https://discord.example/hikes",
-            main.build_hike_components_payload(main.parse_events_js(SAMPLE_EVENTS_JS)[0]),
+            main.build_hike_components_payload(main.parse_events_js(SAMPLE_UPCOMING_HTML)[0]),
         )
     ]
