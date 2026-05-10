@@ -512,7 +512,7 @@ def parse_events_js(html: str) -> list[HikeEvent]:
         cta_url = ""
         cta_text = ""
         if slug and event_type == "free":
-            cta_url = f"{SITE_BASE_URL}/register?hike={slug}"
+            cta_url = f"{SITE_BASE_URL}/hikes/register?hike={slug}"
             cta_text = "Register"
         elif slug and event_type == "paid":
             cta_url = f"{SITE_BASE_URL}/upcoming-events"

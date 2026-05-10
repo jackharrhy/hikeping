@@ -79,8 +79,8 @@ def test_build_hike_components_payload_includes_richer_event_details():
     assert "Variable" in rendered
     assert "2-3 hrs" in rendered
     assert "Bring the pups!" in rendered
-    # /register URL is synthesised from the slug + eventType
-    assert "/register?hike=three-ponds-barrens-dog-day" in rendered
+    # /hikes/register URL is synthesised from the slug + eventType
+    assert "/hikes/register?hike=three-ponds-barrens-dog-day" in rendered
 
 
 def test_post_discord_payload_enables_components_v2(monkeypatch):
