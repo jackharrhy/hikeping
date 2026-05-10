@@ -18,11 +18,12 @@ import polyline
 from apscheduler.schedulers.blocking import BlockingScheduler
 from staticmap import CircleMarker, Line, StaticMap
 
-HIKE_URL = "https://www.stjohnshikeclub.com/upcoming-hike.html"
+SITE_BASE_URL = "https://www.stjohnshikeclub.com"
+HIKE_URL = f"{SITE_BASE_URL}/upcoming-events"
 TIMEZONE = ZoneInfo(os.getenv("HIKEPING_TIMEZONE", "America/St_Johns"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 HIKEPING_INFO_WEBHOOK_URL = os.getenv("HIKEPING_INFO_WEBHOOK_URL", "").strip()
-EVENTS_DATA_URL = "https://www.stjohnshikeclub.com/events-data.js"
+EVENTS_DATA_URL = HIKE_URL  # legacy name; now points at the SSR'd HTML page we scrape
 IS_COMPONENTS_V2 = 1 << 15
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/foot"
@@ -65,8 +66,21 @@ def next_weekend_dates(now: datetime) -> tuple[datetime, datetime]:
 
 
 def fetch_events_js() -> str:
+    """Fetch the SSR'd upcoming-events HTML page.
+
+    Name kept for backward compatibility with prior callers/tests; the
+    underlying source moved from `events-data.js` (deleted upstream Q2 2026)
+    to the dehydrated TanStack Start payload embedded in the page itself.
+    """
+
     with httpx.Client(timeout=20, follow_redirects=True) as client:
-        res = client.get(EVENTS_DATA_URL, headers={"User-Agent": "hikeping/0.1"})
+        res = client.get(
+            HIKE_URL,
+            headers={
+                "User-Agent": "hikeping/0.1 (+https://github.com/jackharrhy/hikeping)",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
         res.raise_for_status()
     return res.text
 
@@ -262,38 +276,70 @@ def render_route_png(
 
 
 def get_next_upcoming_hike_details(now: datetime) -> dict | None:
-    js = fetch_events_js()
-    today = now.date()
-    events: list[dict] = []
+    """Return raw map-link details for the next upcoming hike, or None.
 
-    for block in re.finditer(r"\{\s*id:\s*\".*?\n\s*\},?", js, re.DOTALL):
-        b = block.group(0)
-        date_m = re.search(r'date:\s*"(?P<date>\d{4}-\d{2}-\d{2})"', b)
-        title_m = re.search(r'title:\s*"(?P<title>(?:\\.|[^"])*)"', b)
-        start_m = re.search(r'startGoogle:\s*"(?P<url>(?:\\.|[^"])*)"', b)
-        end_m = re.search(r'endGoogle:\s*"(?P<url>(?:\\.|[^"])*)"', b)
-        if not date_m or not title_m:
+    Used by the ``--with-map`` flow. We re-parse the SSR'd HTML to pull the
+    trailhead/trail-end Google Maps URLs that the schema-aware
+    ``parse_events_js`` does not currently surface on ``HikeEvent``.
+    """
+
+    html = fetch_events_js()
+
+    try:
+        array_src = _extract_hikes_array_source(html)
+    except EventFeedError:
+        return None
+
+    today = now.date()
+    candidates: list[dict] = []
+
+    for block in _extract_event_blocks(array_src):
+        name = _js_string_field(block, "name")
+        date_label = _js_string_field(block, "dateLabel")
+        if not name or not date_label:
             continue
-        events.append(
+        event_date, _ = _parse_date_label(date_label)
+        if event_date is None:
+            continue
+        if event_date.date() < today:
+            continue
+
+        candidates.append(
             {
-                "date": date_m.group("date"),
-                "title": _unescape_js_string(title_m.group("title")),
+                "date": event_date.date().isoformat(),
+                "title": name,
                 "mapLinks": {
-                    "startGoogle": _unescape_js_string(start_m.group("url")) if start_m else None,
-                    "endGoogle": _unescape_js_string(end_m.group("url")) if end_m else None,
+                    # Keep the legacy keys so run_next_hike_with_map() doesn't
+                    # need to know about the rename.
+                    "startGoogle": _js_string_field(block, "trailHeadUrl") or None,
+                    "endGoogle": _js_string_field(block, "trailEndUrl") or None,
                 },
             }
         )
 
-    upcoming = [e for e in events if datetime.strptime(e["date"], "%Y-%m-%d").date() >= today]
-    if not upcoming:
+    if not candidates:
         return None
-    upcoming.sort(key=lambda e: e["date"])
-    return upcoming[0]
+    candidates.sort(key=lambda e: e["date"])
+    return candidates[0]
 
 
 def _unescape_js_string(s: str) -> str:
-    return json.loads(f'"{s}"')
+    """Decode a JS double-quoted string body.
+
+    The dehydrated TanStack Start payload uses JS-literal strings (not JSON), so
+    we need to tolerate a couple of JS-only escapes that ``json.loads`` rejects:
+    ``\\'`` (escaped apostrophe — common in `St. John\\'s`) and ``\\`` followed
+    by a literal newline. Everything else falls through to the JSON parser so we
+    still get correct ``\\uXXXX`` and surrogate-pair handling.
+    """
+
+    # ``\'`` is illegal in JSON but legal in JS string literals.
+    cleaned = s.replace("\\'", "'")
+    try:
+        return json.loads(f'"{cleaned}"')
+    except json.JSONDecodeError:
+        # Last-ditch: strip remaining backslashes the JSON parser refused.
+        return cleaned.replace("\\", "")
 
 
 def _extract_event_blocks(js: str) -> list[str]:
@@ -335,32 +381,156 @@ def _js_string_field(block: str, field: str) -> str:
     return _unescape_js_string(m.group("value"))
 
 
-def parse_events_js(js: str) -> list[HikeEvent]:
+def _extract_hikes_array_source(html: str) -> str:
+    """Pull the `hikes:$R[N]=[ ... ]` array literal out of the SSR'd HTML.
+
+    The St. John's Hike Club site is a TanStack Start app that dehydrates its
+    loader data into the page as JS object/array literals (not JSON). We find
+    the start of the hikes array, then bracket-balance to find the matching `]`,
+    skipping over string contents.
+    """
+
+    m = re.search(r"hikes:\$R\[\d+\]=\[", html)
+    if not m:
+        raise EventFeedError("Could not find dehydrated `hikes` array in upcoming-events HTML")
+
+    i = m.end() - 1  # index of opening `[`
+    depth = 0
+    in_string = False
+    escaped = False
+    end: int | None = None
+
+    while i < len(html):
+        ch = html[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        i += 1
+
+    if end is None:
+        raise EventFeedError("Unterminated dehydrated `hikes` array in upcoming-events HTML")
+
+    return html[m.end() - 1 : end]
+
+
+_DATE_LABEL_RE = re.compile(
+    r"^(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),\s+(?P<year>\d{4})\s*[·•]\s*(?P<time>.+)$"
+)
+
+
+def _parse_date_label(date_label: str) -> tuple[datetime | None, str]:
+    """Parse `"May 10, 2026 · 12:00 p.m."` into (datetime, "12:00 p.m.").
+
+    Returns (None, "") if the label cannot be parsed.
+    """
+
+    m = _DATE_LABEL_RE.match(date_label.strip())
+    if not m:
+        return None, ""
+
+    raw_date = f"{m.group('month')} {m.group('day')} {m.group('year')}"
+    try:
+        parsed = datetime.strptime(raw_date, "%B %d %Y")
+    except ValueError:
+        return None, ""
+
+    return parsed.replace(tzinfo=TIMEZONE), m.group("time").strip()
+
+
+def _split_logistics_line(line: str) -> tuple[str, str, str]:
+    """Split `"Stiles Cove - East Coast Trail · ~8k · 3.5-4 hrs"` into
+    (location, distance, duration). Missing pieces become empty strings.
+    """
+
+    if not line:
+        return "", "", ""
+
+    # The site uses `·` (U+00B7) as the separator; tolerate `•` and `|` too.
+    parts = [p.strip() for p in re.split(r"\s*[·•|]\s*", line) if p.strip()]
+    location = parts[0] if len(parts) > 0 else ""
+    distance = parts[1] if len(parts) > 1 else ""
+    duration = parts[2] if len(parts) > 2 else ""
+    if len(parts) > 3:
+        # Anything trailing gets folded into duration so we don't lose info.
+        duration = " · ".join(parts[2:])
+    return location, distance, duration
+
+
+def parse_events_js(html: str) -> list[HikeEvent]:
+    """Parse the SSR'd `/upcoming-events` HTML into HikeEvent objects.
+
+    The function name is kept for backward compatibility with the previous
+    `events-data.js` scraper; it now operates on the full page HTML instead.
+    Empty/whitespace-only input is treated as "no events found" rather than an
+    error so existing tests that pass `"const EVENTS = [];"` still exercise the
+    "no weekend hike" branch via `get_upcoming_weekend_hike`.
+    """
+
+    if not html or not html.strip():
+        return []
+
+    try:
+        array_src = _extract_hikes_array_source(html)
+    except EventFeedError:
+        # Legacy/empty fixtures: fall through and return no events.
+        return []
+
     events: list[HikeEvent] = []
-    for block in _extract_event_blocks(js):
-        title = _js_string_field(block, "title")
-        date_value = _js_string_field(block, "date")
-        if not title or not date_value:
+    for block in _extract_event_blocks(array_src):
+        name = _js_string_field(block, "name")
+        date_label = _js_string_field(block, "dateLabel")
+        if not name or not date_label:
             continue
 
-        try:
-            event_date = datetime.strptime(date_value, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
-        except ValueError:
+        event_date, start_time = _parse_date_label(date_label)
+        if event_date is None:
             continue
+
+        slug = _js_string_field(block, "id")
+        logistics = _js_string_field(block, "logisticsLine")
+        location, distance, duration = _split_logistics_line(logistics)
+
+        # Free hikes use the in-app /register route; paid hikes don't have a
+        # registration form, so leave cta_url blank and let the message fall
+        # back to the upcoming-events page link.
+        event_type = _js_string_field(block, "eventType")
+        cta_url = ""
+        cta_text = ""
+        if slug and event_type == "free":
+            cta_url = f"{SITE_BASE_URL}/register?hike={slug}"
+            cta_text = "Register"
+        elif slug and event_type == "paid":
+            cta_url = f"{SITE_BASE_URL}/upcoming-events"
+            cta_text = "Event details"
 
         events.append(
             HikeEvent(
                 date=event_date,
-                title=title,
-                start_time=_js_string_field(block, "startTime"),
-                location=_js_string_field(block, "location"),
-                difficulty=_js_string_field(block, "difficulty"),
-                distance=_js_string_field(block, "distance"),
-                duration=_js_string_field(block, "duration"),
-                elevation_gain=_js_string_field(block, "elevationGain"),
+                title=name,
+                start_time=start_time,
+                location=location,
+                difficulty=_js_string_field(block, "difficultyLabel")
+                or _js_string_field(block, "difficulty"),
+                distance=distance,
+                duration=duration,
+                elevation_gain="",
                 description=_js_string_field(block, "description"),
-                cta_text=_js_string_field(block, "ctaText"),
-                cta_url=_js_string_field(block, "ctaUrl"),
+                cta_text=cta_text,
+                cta_url=cta_url,
             )
         )
 
@@ -392,7 +562,7 @@ def get_next_upcoming_hike(now: datetime) -> tuple[datetime, str] | None:
 def get_upcoming_weekend_hike(now: datetime) -> HikeEvent | None:
     events = parse_events_js(fetch_events_js())
     if not events:
-        raise EventFeedError("No events could be parsed from events-data.js")
+        raise EventFeedError("No events could be parsed from upcoming-events page")
 
     sat, sun = next_weekend_dates(now)
     weekend_dates = {sat.date(), sun.date()}
@@ -526,8 +696,8 @@ def check_and_notify() -> None:
     except EventFeedError as exc:
         sat, sun = next_weekend_dates(now)
         msg = (
-            "⚠️ hikeping could not find a complete upcoming weekend hike in "
-            f"events-data.js for {sat.date().isoformat()}/{sun.date().isoformat()}. "
+            "⚠️ hikeping could not find a complete upcoming weekend hike on the "
+            f"upcoming-events page for {sat.date().isoformat()}/{sun.date().isoformat()}. "
             f"The St. John's Hike Club site may have changed: {HIKE_URL}"
         )
         print(f"{msg} ({exc})", file=sys.stderr)
@@ -537,7 +707,7 @@ def check_and_notify() -> None:
             print(f"Failed to post info webhook: {notify_exc}", file=sys.stderr)
         return
     except Exception as exc:
-        msg = f"⚠️ hikeping failed to fetch or parse events-data.js: {exc}"
+        msg = f"⚠️ hikeping failed to fetch or parse upcoming-events page: {exc}"
         print(msg, file=sys.stderr)
         try:
             notify_info(msg)
@@ -582,7 +752,7 @@ def run_next_hike_with_map(post: bool = False, webhook_url: str | None = None) -
         return
 
     date = datetime.strptime(event["date"], "%Y-%m-%d").replace(tzinfo=TIMEZONE)
-    title = _unescape_js_string(event["title"])
+    title = event["title"]
     pretty_date = date.strftime("%a, %b %d").replace(" 0", " ")
 
     map_links = event.get("mapLinks") or {}
@@ -648,7 +818,7 @@ def main() -> None:
     parser.add_argument(
         "--next",
         action="store_true",
-        help="Show the next upcoming hike from events-data.js",
+        help="Show the next upcoming hike from the upcoming-events page",
     )
     parser.add_argument(
         "--post",

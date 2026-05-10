@@ -2,7 +2,7 @@
 
 Tiny `uv` app that checks the St. John's Hike Club upcoming-hike page and posts to Discord if it looks like there is a hike this upcoming weekend.
 
-Page checked: https://www.stjohnshikeclub.com/upcoming-hike.html
+Page checked: https://www.stjohnshikeclub.com/upcoming-events
 
 ## Setup
 
@@ -44,7 +44,7 @@ Set `HIKEPING_INFO_WEBHOOK_URL` to send scraper-health alerts to a separate Disc
 
 ## Notes
 
-- Discord hike posts include the title, date, time, location, difficulty, distance, registration link, and hike page link when those fields exist in `events-data.js`.
+- Discord hike posts include the title, date, time, location, difficulty, distance, registration link, and hike page link when those fields are available on the upcoming-events page.
 - If no weekend hike is detected, it logs and does not post.
 - If the structured event feed cannot be parsed, it logs and posts an alert to `HIKEPING_INFO_WEBHOOK_URL` when set.
 - `--with-map` uses free OSM/Nominatim + OSRM public APIs and attaches `next-hike-route.png`.
